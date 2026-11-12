@@ -1,0 +1,13 @@
+catalog_version: '1.0'
+actions:
+  - id: JUMP
+    input_actions: [IA_Jump]
+    description: Test the jump action while the player is grounded.
+    semantic_status: USER_CONFIRMED
+    ai_allowed: true
+    prerequisites: [player_exists, on_ground]
+  - id: INTERACT
+    input_actions: [IA_Interact]
+    description: Interact with an object.
+    semantic_status: NEEDS_CONFIRMATION
+    ai_allowed: false

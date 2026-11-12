@@ -1,0 +1,17 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "FriendlyName": "Background Input Probe",
+  "EnabledByDefault": false,
+  "Modules": [
+    {
+      "Name": "BackgroundInputProbe",
+      "Type": "Runtime",
+      "LoadingPhase": "Default",
+      "PlatformAllowList": ["Win64"],
+      "TargetAllowList": ["Game"],
+      "TargetConfigurationAllowList": ["Development"]
+    }
+  ],
+  "Plugins": [{"Name": "EnhancedInput", "Enabled": true}]
+}

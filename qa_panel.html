@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="qa-token" content="__PANEL_TOKEN__">
+  <title>Unreal Auto QA · 모의 테스트</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #10141d; color: #edf2fa; font: 16px/1.5 Inter, "Malgun Gothic", sans-serif; }
+    main { max-width: 760px; margin: auto; padding: 48px 24px; }
+    h1 { margin: 0; letter-spacing: -.04em; }
+    p { color: #b0bfd3; }
+    section { padding: 24px; margin-top: 24px; background: #19212f; border: 1px solid #35435a; border-radius: 14px; }
+    form { display: grid; gap: 18px; }
+    label { display: grid; gap: 6px; }
+    input, select, button { font: inherit; padding: 9px 12px; border: 1px solid #60708a; border-radius: 8px; }
+    input, select { color: inherit; background: #10141d; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    button { color: inherit; background: #27364b; cursor: pointer; }
+    button[type=submit] { color: #10141d; background: #a6d8ff; border-color: #a6d8ff; font-weight: 700; }
+    button:disabled { opacity: .55; cursor: default; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; }
+    #status { margin-bottom: 0; }
+    #steps { display: grid; gap: 12px; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Unreal Auto QA</h1>
+    <p>__PANEL_MODE__</p>
+    <p>Decisions 키를 등록하려면 프로젝트 폴더에서 <code>Register-OpenAI-Key.cmd</code>를 실행하세요.</p>
+    <section aria-label="프로젝트 준비">
+      <details>
+        <summary>Unreal 프로젝트 준비</summary>
+        <form id="project-form">
+          <label>프로젝트 (.uproject)
+            <input id="project-path" list="project-list" required placeholder="프로젝트 파일의 전체 경로">
+            <datalist id="project-list"></datalist>
+          </label>
+          <div class="actions">
+            <button type="button" id="project-doctor">환경 진단</button>
+            <button type="button" id="project-recover">중단된 설치 복구</button>
+          </div>
+          <label>플러그인 작업
+            <select id="plugin-mode"><option value="install">설치 또는 업데이트</option><option value="remove">제거</option></select>
+          </label>
+          <label id="plugin-source-label">GameQABridge 소스 폴더
+            <input id="plugin-source" placeholder="플러그인 폴더의 전체 경로">
+          </label>
+          <div class="actions">
+            <button type="button" id="plugin-preview">변경 미리보기</button>
+            <button type="button" id="plugin-apply" disabled>승인하고 적용</button>
+          </div>
+          <strong id="project-status" role="status"></strong>
+          <pre id="project-result" hidden></pre>
+        </form>
+      </details>
+    </section>
+    <section aria-label="AI 테스트">
+      <form id="ai-form">
+        <label>최대 Decisions 호출 횟수 <input id="max-calls" type="number" min="1" max="20" value="2" required></label>
+        <p>실행하면 등록된 키로 Decisions를 호출합니다. 실행 시간은 최대 60초이며 예상 비용 중단 기준은 $0.01입니다.</p>
+        <div class="actions">
+          <button type="submit" id="run" __AI_DISABLED__>AI 테스트 시작</button>
+          <button type="button" id="cancel" disabled>중단</button>
+        </div>
+      </form>
+      <p __GAME_HINT_HIDDEN__>패키징된 게임 EXE를 지정해 실행하세요. <code>Start-QA.cmd --game "&lt;게임 EXE&gt;"</code></p>
+    </section>
+    <section aria-label="테스트 결과">
+      <strong id="status" role="status">실행하면 게임의 활성 매핑을 읽습니다.</strong>
+      <pre id="result" hidden></pre>
+    </section>
+  </main>
+  <script>
+    if (location.protocol === 'file:') {
+      document.querySelector('main').innerHTML = `
+        <h1>Unreal Auto QA</h1>
+        <p>이 파일을 직접 열면 QA 테스트를 실행할 수 없습니다.</p>
+        <p>프로젝트 폴더에서 <strong>Start-QA.cmd</strong>를 더블클릭하세요.</p>
+        <p>실행 창에 <code>UE QA panel</code>이 표시되면 창을 열어 둔 채 <a style="color: #a6d8ff" href="http://127.0.0.1:18500">로컬 QA 패널</a>을 여세요.</p>`;
+    } else {
+    const byId = id => document.getElementById(id);
+    const form = byId('ai-form');
+    const token = document.querySelector('meta[name="qa-token"]').content;
+    async function request(path, body) {
+      const response = await fetch(path, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'X-QA-Token': token},
+        body: JSON.stringify(body)
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error);
+      return data;
+    }
+    let approvedPlan;
+    const projectForm = byId('project-form');
+    const projectStatus = byId('project-status');
+    const projectResult = byId('project-result');
+    projectForm.addEventListener('submit', event => event.preventDefault());
+    projectForm.addEventListener('input', () => {
+      approvedPlan = undefined;
+      byId('plugin-apply').disabled = true;
+      byId('plugin-source-label').hidden = byId('plugin-mode').value === 'remove';
+    });
+    request('/projects', {}).then(data => {
+      for (const path of data.projects) byId('project-list').append(new Option(path));
+    }).catch(error => {
+      projectStatus.textContent = `프로젝트 자동 탐색 실패 · ${error.message}`;
+    });
+    async function projectOperation(operation) {
+      if (!projectForm.reportValidity()) return;
+      const values = {
+        project: byId('project-path').value.trim(),
+        source: byId('plugin-source').value.trim(),
+        mode: byId('plugin-mode').value
+      };
+      const approval = approvedPlan;
+      approvedPlan = undefined;
+      for (const control of projectForm.elements) control.disabled = true;
+      projectStatus.textContent = '처리 중';
+      projectResult.hidden = true;
+      try {
+        const result = await request('/project/' + operation, {...values, approval});
+        if (operation === 'preview' && result.approved_operations.length) approvedPlan = result.approval;
+        const messages = {
+          doctor: result.status === 'NEEDS_USER_ACTION' ? '환경 요구 사항이 남아 있습니다.' : '진단 완료 · 변경 미리보기 가능',
+          preview: approvedPlan ? '경로와 파일 목록을 확인하고 승인하세요.' : '적용할 변경이 없습니다.',
+          recover: result.recovered ? '중단된 설치를 복구했습니다.' : '복구할 설치가 없습니다.',
+          apply: '승인한 변경을 적용했습니다.'
+        };
+        projectStatus.textContent = messages[operation];
+        projectResult.textContent = JSON.stringify(result, null, 2);
+        projectResult.hidden = false;
+      } catch (error) {
+        projectStatus.textContent = `프로젝트 작업 실패 · ${error.message}`;
+      } finally {
+        for (const control of projectForm.elements) control.disabled = false;
+        byId('plugin-apply').disabled = !approvedPlan;
+      }
+    }
+    for (const [id, operation] of Object.entries({
+      'project-doctor': 'doctor', 'project-recover': 'recover',
+      'plugin-preview': 'preview', 'plugin-apply': 'apply'
+    })) byId(id).addEventListener('click', () => projectOperation(operation));
+    const run = byId('run');
+    const cancel = byId('cancel');
+    const status = byId('status');
+    const result = byId('result');
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      run.disabled = true;
+      cancel.disabled = false;
+      result.hidden = true;
+      status.textContent = '게임 매핑 조회 및 Decisions 테스트 실행 중';
+      try {
+        const report = await request('/run', {max_calls: byId('max-calls').valueAsNumber});
+        status.textContent = report.verdict + ' · ' + report.exploration.outcome;
+        result.textContent = JSON.stringify(report, null, 2);
+        result.hidden = false;
+      } catch (error) {
+        status.textContent = '테스트 오류 · ' + error.message;
+      } finally {
+        run.disabled = false;
+        cancel.disabled = true;
+      }
+    });
+    cancel.addEventListener('click', async () => {
+      cancel.disabled = true;
+      try {
+        await request('/cancel', {});
+        if (run.disabled) status.textContent = '중단 요청 중';
+      } catch (error) {
+        status.textContent = '중단 오류 · ' + error.message;
+        cancel.disabled = false;
+      }
+    });
+    }
+  </script>
+</body>
+</html>

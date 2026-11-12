@@ -1,0 +1,5 @@
+__pycache__/
+/runs/
+/.qa-build/
+/UnrealAutoQA-Mock-win-x64.zip
+/UnrealAutoQA-win-x64.zip

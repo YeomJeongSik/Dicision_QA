@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.0",
+  "id": "ue-movement-smoke",
+  "mode": "scripted",
+  "preconditions": [
+    "game_ready",
+    "player_exists",
+    {"input_action_available": "MOVE_FORWARD"},
+    {"input_action_available": "JUMP"}
+  ],
+  "actions": [
+    {
+      "id": "move",
+      "do": "MOVE_FORWARD",
+      "hold_ms": 200,
+      "assertions": [
+        {"type": "input_action_event", "action": "MOVE_FORWARD"},
+        {"type": "position_delta_min", "axis": "horizontal", "value": 10}
+      ]
+    },
+    {
+      "id": "jump",
+      "do": "JUMP",
+      "press_ms": 100,
+      "assertions": [{"type": "input_action_event", "action": "JUMP"}]
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "catalog_version": "1.0",
+  "actions": [
+    {
+      "id": "MOVE_FORWARD",
+      "input_actions": ["IA_Move"],
+      "description": "Move forward with the fixture's W mapping.",
+      "semantic_status": "ADAPTER_VERIFIED",
+      "ai_allowed": true,
+      "prerequisites": ["player_exists"]
+    },
+    {
+      "id": "JUMP",
+      "input_actions": ["IA_Jump"],
+      "description": "Jump from the fixture's spawn area.",
+      "semantic_status": "ADAPTER_VERIFIED",
+      "ai_allowed": true,
+      "prerequisites": ["player_exists", "on_ground"]
+    }
+  ]
+}

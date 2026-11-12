@@ -1,0 +1,17 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "FriendlyName": "Game QA Bridge",
+  "EnabledByDefault": false,
+  "Modules": [
+    {
+      "Name": "GameQABridge",
+      "Type": "Runtime",
+      "LoadingPhase": "PostEngineInit",
+      "PlatformAllowList": ["Win64"],
+      "TargetAllowList": ["Game"],
+      "TargetConfigurationAllowList": ["Development"]
+    }
+  ],
+  "Plugins": [{"Name": "EnhancedInput", "Enabled": true}]
+}

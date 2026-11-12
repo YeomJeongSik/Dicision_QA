@@ -1,0 +1,6 @@
+{
+  "answers": [
+    {"type": "choice", "name": "next_action", "choice": "JUMP"}
+  ],
+  "model": "gpt-6-luna"
+}
