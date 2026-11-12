@@ -10,7 +10,7 @@ STATES = ("DISCOVERED", "NEEDS_CONFIRMATION", "USER_CONFIRMED", "ADAPTER_VERIFIE
 SCOPES = ("selected_actions", "selected_keys", "all_mapped")
 
 
-def discovered_actions(mappings, observation):
+def discovered_actions(mappings, observation, *, key_variants=False):
     """Expose only unambiguous actions the UE bridge currently allows executing."""
     if observation.get("player_exists") is not True:
         return {}
@@ -18,11 +18,17 @@ def discovered_actions(mappings, observation):
     for key, action in mappings["keys"].items():
         if isinstance(action, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", action) and action != "WAIT":
             bindings.setdefault(action, []).append(key)
-    return {
-        action: (keys, action, f"Exercise Unreal Input Action {action}, currently mapped to {keys[0]}.")
-        for action, keys in bindings.items()
-        if len(keys) == 1 and (action != "IA_Jump" or observation.get("on_ground") is True)
-    }
+    candidates = {}
+    for action, keys in bindings.items():
+        if action == "IA_Jump" and observation.get("on_ground") is not True:
+            continue
+        if len(keys) == 1 or key_variants:
+            candidates[action] = ([keys[0]], action, f"Press {keys[0]}.")
+        if key_variants and len(keys) > 1:
+            for key in keys:
+                if re.fullmatch(r"[A-Za-z0-9_]{1,64}", key):
+                    candidates[f"{action}@{key}"] = ([key], action, f"Press {key}.")
+    return candidates
 
 
 def read_catalog(path):

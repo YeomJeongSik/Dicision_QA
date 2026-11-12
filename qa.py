@@ -40,7 +40,7 @@ from spikes.decisions_smoke import choice_body, classify_answer, request_choice
 
 ROOT = Path(__file__).resolve().parent
 FROZEN = getattr(sys, "frozen", False)
-OUT = (Path(os.environ["LOCALAPPDATA"]) / "UnrealAutoQA" if FROZEN else ROOT) / "runs"
+OUT = (Path(sys.executable).resolve().parent if FROZEN else ROOT) / "runs"
 LIVE_INTERVAL_SECONDS = 2
 MAX_SIMULTANEOUS_INPUTS = 12
 # shortcut: reserve estimated tokens for the current short text payload, replace with a
@@ -220,7 +220,7 @@ def wait_for_ue_world(call):
         time.sleep(0.05)
 
 
-def ue_input_verdict(status, expected, before, after, events, capabilities):
+def ue_input_verdict(status, expected, before, after, events, capabilities, *, gameplay=False):
     if status == "cancelled":
         return "CANCELLED"
     if status != "completed" or after["held_keys"]:
@@ -240,10 +240,13 @@ def ue_input_verdict(status, expected, before, after, events, capabilities):
         return "FAIL"
     if "IA_Jump" in expected:
         if capabilities.get("jump_rise_event") is not True:
-            return "PASS" if end[2] - start[2] > 0.5 else "INCONCLUSIVE"
-        if not any(item["layer"] == "L3" and item["kind"] == "JumpRise" and item["value"] == "IA_Jump"
+            if end[2] - start[2] <= 0.5:
+                return "INCONCLUSIVE"
+        elif not any(item["layer"] == "L3" and item["kind"] == "JumpRise" and item["value"] == "IA_Jump"
                    for item in events["events"]):
             return "FAIL"
+    if gameplay and set(expected) - {"IA_Move", "IA_Jump"}:
+        return "INPUT_CONFIRMED"
     return "PASS"
 
 
@@ -580,7 +583,7 @@ def explore(allowed, max_calls, max_seconds, live=False, *, max_input_tokens=100
     for check in checks:
         actions = check.split("+")
         if (len(actions) > MAX_SIMULTANEOUS_INPUTS or len(actions) != len(set(actions)) or any(
-                action == "WAIT" or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", action)
+                action == "WAIT" or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}(?:@[A-Za-z0-9_]{1,64})?", action)
                 for action in actions)):
             raise Rejected("INVALID_TEST_CHECK")
         check_results.setdefault("+".join(sorted(actions)), "UNVERIFIED")
@@ -608,7 +611,7 @@ def explore(allowed, max_calls, max_seconds, live=False, *, max_input_tokens=100
     started = time.monotonic()
 
     def current_candidates(mappings, observation):
-        available = discovered_actions(mappings, observation)
+        available = discovered_actions(mappings, observation, key_variants=bool(check_results))
         if not check_results:
             return available
         candidates = {}
@@ -616,7 +619,9 @@ def explore(allowed, max_calls, max_seconds, live=False, *, max_input_tokens=100
             actions = check.split("+")
             if verdict == "UNVERIFIED" and all(action in available for action in actions):
                 keys = [available[action][0][0] for action in actions]
-                candidates[check] = (keys, check, f"Test {' + '.join(actions)} together ({', '.join(keys)}).")
+                if len(set(keys)) == len(keys):
+                    expected = "+".join(available[action][1] for action in actions)
+                    candidates[check] = (keys, expected, f"Press {' + '.join(keys)}.")
         return candidates
 
     with (ue_transport(executable) if executable else transport()) as call:
@@ -802,7 +807,10 @@ def explore(allowed, max_calls, max_seconds, live=False, *, max_input_tokens=100
                     evidence = call(f"/events?after_seq={before['observation_seq']}")
                     attempt["mapping_revision"] = mappings["mapping_revision"]
                     attempt["verdict"] = ue_input_verdict(attempt["command_status"], action.split("+"), before,
-                                                         attempt["after"], evidence, capabilities)
+                                                         attempt["after"], evidence, capabilities, gameplay=True)
+                    if attempt["verdict"] == "PASS" and any(
+                            item.startswith("IA_Move@") for item in choice.split("+")):
+                        attempt["verdict"] = "INPUT_CONFIRMED"
                     if check_results:
                         check_results[choice] = attempt["verdict"]
                         if "UNVERIFIED" not in check_results.values():
@@ -1193,6 +1201,8 @@ def main():
     ai.add_argument("--max-seconds", type=int, default=30)
     actions = commands.add_parser("list-actions", help="List testable Unreal action IDs without a Decisions call")
     actions.add_argument("game", type=Path, help="Packaged Win64 game executable")
+    actions.add_argument("--with-keys", action="store_true", help="Include the keyboard mapping for each action")
+    actions.add_argument("--from-report", type=Path, help="Read the mapping captured by the QA build smoke test")
     ui = commands.add_parser("panel")
     ui.add_argument("--port", type=int, default=18500)
     ui.add_argument("--open-browser", action="store_true")
@@ -1205,6 +1215,7 @@ def main():
     fingerprint = commands.add_parser("project-fingerprint")
     fingerprint.add_argument("project", type=Path)
     fingerprint.add_argument("--engine-build", required=True)
+    fingerprint.add_argument("--metadata-only", action="store_true")
     copy_inputs = commands.add_parser("project-copy-inputs")
     copy_inputs.add_argument("project", type=Path)
     copy_inputs.add_argument("destination", type=Path)
@@ -1220,10 +1231,22 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "list-actions":
-            with ue_transport(args.game) as call:
-                wait_for_ue_world(call)
-                actions = discovered_actions(call("/mappings"), {"player_exists": True, "on_ground": True})
-            print(json.dumps(sorted(actions)))
+            if args.from_report:
+                mappings = json.loads(args.from_report.read_text(encoding="utf-8"))["mappings"]
+            else:
+                with ue_transport(args.game) as call:
+                    wait_for_ue_world(call)
+                    mappings = call("/mappings")
+            actions = discovered_actions(mappings, {"player_exists": True, "on_ground": True},
+                                         key_variants=args.with_keys)
+            if args.with_keys:
+                modifiers = {item["key"]: item["modifiers"] for item in mappings.get("effective_mappings", [])
+                             if item["modifiers"]}
+                result = {name: {"key": keys[0], "modifiers": modifiers.get(keys[0], [])}
+                          for name, (keys, _, _) in sorted(actions.items())}
+            else:
+                result = sorted(actions)
+            print(json.dumps(result, separators=(",", ":")))
             return 0
         if args.command == "bridge-health":
             print(json.dumps(bridge_health(args.executable), indent=2))
@@ -1233,7 +1256,8 @@ def main():
             print(f'UE {result["verdict"]}: {OUT / result["run_id"]}.json')
             return 0 if result["verdict"] == "PASS" else 2
         if args.command == "project-fingerprint":
-            print(json.dumps(project_fingerprint(args.project, args.engine_build), ensure_ascii=False))
+            print(json.dumps(project_fingerprint(args.project, args.engine_build, metadata_only=args.metadata_only),
+                             ensure_ascii=False))
             return 0
         if args.command == "project-copy-inputs":
             print(json.dumps(copy_project_inputs(args.project, args.destination), ensure_ascii=False))

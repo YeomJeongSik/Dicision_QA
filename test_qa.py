@@ -96,6 +96,15 @@ class MockQaTests(unittest.TestCase):
         self.assertEqual(available["IA_Move"][0], ["I"])
         self.assertEqual(set(qa.discovered_actions(mappings, {"player_exists": True, "on_ground": False})),
                          {"IA_Move"})
+        variants = qa.discovered_actions(mappings, {"player_exists": True, "on_ground": True}, key_variants=True)
+        self.assertEqual(variants["IA_Ambiguous@Q"][:2], (["Q"], "IA_Ambiguous"))
+        self.assertEqual(variants["IA_Ambiguous@E"][:2], (["E"], "IA_Ambiguous"))
+
+    def test_generic_action_trigger_does_not_pass_gameplay(self):
+        pose = {"pawn_position": [0, 0, 0], "held_keys": []}
+        events = {"lost": False, "events": [{"layer": "L2", "kind": "Triggered", "value": "IA_Interact"}]}
+        result = qa.ue_input_verdict("completed", ["IA_Interact"], pose, pose, events, {}, gameplay=True)
+        self.assertEqual(result, "INPUT_CONFIRMED")
 
     def test_actual_bridge_upgrade_recovers_after_backup_rename(self):
         import shutil

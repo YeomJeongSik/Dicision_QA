@@ -34,7 +34,7 @@ def file_hash(path):
     return digest.hexdigest()
 
 
-def tree_hashes(root, *, skip_plugin_outputs=False):
+def tree_hashes(root, *, skip_plugin_outputs=False, fingerprint_file=file_hash):
     if not stat.S_ISDIR(check_regular(root).st_mode):
         raise Rejected("PROJECT_NOT_DIRECTORY")
     files = {}
@@ -51,7 +51,7 @@ def tree_hashes(root, *, skip_plugin_outputs=False):
             check_regular(base / name)
         for name in names:
             path = base / name
-            files[path.relative_to(root).as_posix()] = file_hash(path)
+            files[path.relative_to(root).as_posix()] = fingerprint_file(path)
     return files
 
 
@@ -59,20 +59,27 @@ def canonical_hash(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def project_input_hashes(project):
+def project_input_hashes(project, *, fingerprint_file=file_hash):
     if project.suffix.lower() != ".uproject":
         raise Rejected("UPROJECT_REQUIRED")
-    files = {project.name: file_hash(project)}
+    files = {project.name: fingerprint_file(project)}
     for name in ("Source", "Content", "Config", "Plugins"):
         folder = project.parent / name
         if os.path.lexists(folder):
-            hashes = tree_hashes(folder, skip_plugin_outputs=name == "Plugins")
+            hashes = tree_hashes(folder, skip_plugin_outputs=name == "Plugins", fingerprint_file=fingerprint_file)
             files.update({f"{name}/{path}": digest for path, digest in hashes.items()})
     return files
 
 
-def project_fingerprint(project, engine_build):
-    files = project_input_hashes(project)
+def file_metadata(path):
+    info = check_regular(path)
+    if not stat.S_ISREG(info.st_mode):
+        raise Rejected("PROJECT_NONREGULAR_FILE")
+    return [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+
+
+def project_fingerprint(project, engine_build, *, metadata_only=False):
+    files = project_input_hashes(project, fingerprint_file=file_metadata if metadata_only else file_hash)
     return {"engine_build": engine_build, "fingerprint": canonical_hash([engine_build, files]),
             "file_count": len(files)}
 

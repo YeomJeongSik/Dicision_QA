@@ -2,15 +2,17 @@
 
 import ctypes
 import os
+import sys
 from ctypes import wintypes
 from pathlib import Path
 from uuid import uuid4
 
 
 def key_file():
-    if os.name != "nt" or not os.environ.get("LOCALAPPDATA"):
+    if os.name != "nt":
         raise OSError("Windows credential storage unavailable")
-    return Path(os.environ["LOCALAPPDATA"]) / "UnrealAutoQA" / "decisions-key.dpapi"
+    root = Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
+    return root / "runs" / "decisions-key.dpapi"
 
 
 class DataBlob(ctypes.Structure):
@@ -58,7 +60,13 @@ def load_key():
     try:
         encrypted = key_file().read_bytes()
     except FileNotFoundError:
-        return ""
+        legacy_root = os.environ.get("LOCALAPPDATA")
+        if not legacy_root:
+            return ""
+        try:
+            encrypted = (Path(legacy_root) / "UnrealAutoQA" / "decisions-key.dpapi").read_bytes()
+        except FileNotFoundError:
+            return ""
     try:
         return convert(encrypted, encrypt=False).decode("ascii")
     except UnicodeError:

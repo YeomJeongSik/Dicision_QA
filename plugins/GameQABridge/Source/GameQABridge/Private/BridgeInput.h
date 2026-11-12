@@ -30,9 +30,6 @@ public:
     enum class ELayer { Key, Action, Pawn };
 
     static constexpr int32 MaxInputs = 12;
-    using FInputMask = uint16;
-
-    static constexpr FInputMask InputBit(int32 Index) { return FInputMask(1u << Index); }
 
     struct FBinding
     {
@@ -64,8 +61,8 @@ public:
         EStatus Status = EStatus::Idle;
         int32 World = 0;
         int32 Mapping = 0;
-        FInputMask Held = 0;
-        FInputMask Pressed = 0;
+        TSet<int32> Held;
+        TSet<int32> Pressed;
         TArray<FBinding> Bindings;
         uint64 EventSeq = 0;
         bool bReady = false;
@@ -92,6 +89,7 @@ public:
 
     void Configure()
     {
+        GConfig->GetBool(TEXT("GameQABridge"), TEXT("AutoDiscoverKeys"), bAutoDiscoverKeys, GGameIni);
         TArray<FString> Configured;
         if (!GConfig->GetArray(TEXT("GameQABridge"), TEXT("ApprovedKeys"), Configured, GGameIni))
         {
@@ -100,8 +98,7 @@ public:
         for (const FString& Name : Configured)
         {
             const FKey Key(FName(*Name, FNAME_Find));
-            if (Key.IsValid() && Key.IsBindableInBlueprints() && !Key.IsGamepadKey()
-                && !Key.IsMouseButton() && !Key.IsAnalog() && !Key.IsTouch())
+            if (IsDigitalInput(Key))
             {
                 ApprovedKeys.Add(Key);
             }
@@ -196,7 +193,7 @@ public:
             TargetPawn.Reset();
             Actions.Reset();
             State.bReady = false;
-            State.Pressed = 0;
+            State.Pressed.Reset();
             State.Bindings.Reset();
             EffectiveMappings.Reset();
             ActiveContexts.Reset();
@@ -246,10 +243,10 @@ public:
             ReadyFrames = 0;
         }
         State.bReady = ReadyFrames == 8;
-        State.Pressed = 0;
+        State.Pressed.Reset();
         for (int32 Index = 0; PC && Index < State.Bindings.Num(); ++Index)
         {
-            if (PC->IsInputKeyDown(FKey(State.Bindings[Index].Key))) { State.Pressed |= InputBit(Index); }
+            if (PC->IsInputKeyDown(FKey(State.Bindings[Index].Key))) { State.Pressed.Add(Index); }
         }
         if (Pawn)
         {
@@ -279,27 +276,26 @@ public:
         DownDevice = IPlatformInputDeviceMapper::Get().GetPrimaryInputDeviceForUser(LP->GetPlatformUserId());
         DownViewport = Viewport;
         const int32 At = Transitions[Next].AtMs;
-        FInputMask Changed = 0;
+        TSet<int32> Changed;
         while (Transitions.IsValidIndex(Next) && Transitions[Next].AtMs == At)
         {
             const auto& Step = Transitions[Next];
-            const auto Bit = InputBit(Step.BindingIndex);
-            if (Changed & Bit) { break; }
-            if (!DownDevice.IsValid() || (Step.bDown && (State.Pressed & Bit)))
+            if (Changed.Contains(Step.BindingIndex)) { break; }
+            if (!DownDevice.IsValid() || (Step.bDown && State.Pressed.Contains(Step.BindingIndex)))
             {
                 Finish(EStatus::Cancelled);
                 return;
             }
-            if (Step.bDown) { State.Held |= Bit; }
+            if (Step.bDown) { State.Held.Add(Step.BindingIndex); }
             if (!Send(Step.BindingIndex, Step.bDown))
             {
                 Finish(EStatus::Cancelled);
                 return;
             }
-            if (!Step.bDown) { State.Held &= ~Bit; }
-            ReportedActions &= ~Bit;
+            if (!Step.bDown) { State.Held.Remove(Step.BindingIndex); }
+            ReportedActions.Remove(Step.BindingIndex);
             Record(Step.BindingIndex, Step.bDown);
-            Changed |= Bit;
+            Changed.Add(Step.BindingIndex);
             ++Next;
         }
         const int32 Following = Transitions.IsValidIndex(Next) ? Transitions[Next].AtMs : Duration;
@@ -315,14 +311,13 @@ public:
         if (!PlayerInput) { return; }
         for (int32 Index = 0; Index < Actions.Num(); ++Index)
         {
-            const auto Bit = InputBit(Index);
-            if (!(State.Held & Bit) || (ReportedActions & Bit)) { continue; }
+            if (!State.Held.Contains(Index) || ReportedActions.Contains(Index)) { continue; }
             const auto* Action = Actions[Index].Get();
             const auto* Instance = Action ? PlayerInput->FindActionInstanceData(Action) : nullptr;
             if (Instance && Instance->GetTriggerEvent() == ETriggerEvent::Triggered)
             {
                 Record(Index, true, ELayer::Action);
-                ReportedActions |= Bit;
+                ReportedActions.Add(Index);
                 if (State.Bindings[Index].Action == JumpName && State.bGrounded)
                 {
                     JumpStart = State.Position.Z;
@@ -339,6 +334,13 @@ public:
     }
 
 private:
+    static bool IsDigitalInput(const FKey& Key)
+    {
+        return Key.IsValid() && Key.IsBindableInBlueprints() && !Key.IsGamepadKey()
+            && !Key.IsMouseButton() && !Key.IsAnalog() && !Key.IsTouch()
+            && Key != EKeys::AnyKey && Key != EKeys::F11;
+    }
+
     inline static const FName JumpName{TEXT("IA_Jump")};
 
     struct FAllowedActions
@@ -354,6 +356,7 @@ private:
         if (!Input) { return Result; }
 
         TMap<FName, const FEnhancedActionKeyMapping*> ByAction;
+        TArray<const FEnhancedActionKeyMapping*> Eligible;
         TMap<FName, const UInputAction*> ByKey;
         for (const auto& Mapping : Input->GetEnhancedActionMappingsView())
         {
@@ -364,11 +367,18 @@ private:
             Result.Signature = HashCombine(Result.Signature, PointerHash(Mapping.Action.Get()));
             for (const auto& Trigger : Mapping.Triggers) { Result.Signature = HashCombine(Result.Signature, PointerHash(Trigger.Get())); }
             for (const auto& Modifier : Mapping.Modifiers) { Result.Signature = HashCombine(Result.Signature, PointerHash(Modifier.Get())); }
-            if (!ApprovedKeys.Contains(Mapping.Key)) { continue; }
+            if (bAutoDiscoverKeys)
+            {
+                if (!IsDigitalInput(Mapping.Key) || Input->DebugExecBindings.ContainsByPredicate(
+                    [&Mapping](const FKeyBind& Binding) { return Binding.Key == Mapping.Key; })) { continue; }
+            }
+            else if (!ApprovedKeys.Contains(Mapping.Key)) { continue; }
 
+            Eligible.Add(&Mapping);
             if (auto** Existing = ByAction.Find(Action))
             {
-                if (*Existing && ((*Existing)->Action != Mapping.Action || (*Existing)->Key != Mapping.Key))
+                if (*Existing && ((*Existing)->Action != Mapping.Action
+                    || (!bAutoDiscoverKeys && (*Existing)->Key != Mapping.Key)))
                 {
                     *Existing = nullptr;
                 }
@@ -382,6 +392,22 @@ private:
             else { ByKey.Add(Key, Mapping.Action.Get()); }
         }
 
+        if (bAutoDiscoverKeys)
+        {
+            TSet<FName> AddedKeys;
+            for (const auto* Mapping : Eligible)
+            {
+                const auto Key = Mapping->Key.GetFName();
+                const auto Action = Mapping->Action->GetFName();
+                const auto* Canonical = ByAction.FindRef(Action);
+                if (!Canonical || ByKey.FindRef(Key) != Mapping->Action.Get() || AddedKeys.Contains(Key)) { continue; }
+                AddedKeys.Add(Key);
+                Result.Bindings.Add({Key, Action});
+                Result.Actions.Add(Mapping->Action.Get());
+            }
+            return Result;
+        }
+
         TArray<FName> Names;
         ByAction.GetKeys(Names);
         Names.Sort(FNameLexicalLess());
@@ -391,7 +417,6 @@ private:
             if (!Mapping || ByKey.FindRef(Mapping->Key.GetFName()) != Mapping->Action.Get()) { continue; }
             Result.Bindings.Add({Mapping->Key.GetFName(), Name});
             Result.Actions.Add(Mapping->Action.Get());
-            if (Result.Bindings.Num() == MaxInputs) { break; }
         }
         return Result;
     }
@@ -441,15 +466,15 @@ private:
         if (State.Status != EStatus::Running) { return; }
         for (int32 Index = 0; Index < State.Bindings.Num(); ++Index)
         {
-            if (State.Held & InputBit(Index))
+            if (State.Held.Contains(Index))
             {
                 Send(Index, false);
                 Record(Index, false);
             }
         }
-        State.Held = 0;
+        State.Held.Reset();
         Transitions.Reset();
-        ReportedActions = 0;
+        ReportedActions.Reset();
         JumpIndex = INDEX_NONE;
         State.Status = Status;
     }
@@ -473,6 +498,7 @@ private:
     std::mutex Mutex;
     FState State;
     TSet<FKey> ApprovedKeys;
+    bool bAutoDiscoverKeys = false;
     TArray<FMappingInfo> EffectiveMappings;
     TMap<FString, int32> ActiveContexts;
     uint32 MappingSignature = 0;
@@ -487,7 +513,7 @@ private:
     TArray<FTransition> Transitions;
     int32 Next = 0, Duration = 0;
     int32 ReadyFrames = 0;
-    FInputMask ReportedActions = 0;
+    TSet<int32> ReportedActions;
     double NextAt = 0.0, DeadlineAt = 0.0, LeaseUntil = 0.0, LastWorldTick = 0.0, JumpStart = 0.0;
     bool bCancel = false;
     int32 JumpIndex = INDEX_NONE;

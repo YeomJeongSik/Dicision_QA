@@ -1,15 +1,15 @@
 # Unreal Auto QA
 
-When the user asks to test Unreal gameplay, use the packaged Win64 Development game with GameQABridge enabled. Use the game executable the user supplied or the `executable` field in the matching project's `runs/game-builds/*.last-good.json`. If only an Unreal project is available, follow the README to build its QA package and use the returned executable path. Ask for the project or executable only when the target cannot be identified.
+When the user asks for Unreal gameplay QA with this tool, run `Project-QA.ps1` from this tool folder. It finds the parent Unreal project and its installed engine and prepares or reuses an isolated QA build.
 
-Run from this repository with Python 3.10 or later. Translate the request into a short gameplay objective and pass it as one argument.
+1. Run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Project-QA.ps1 -ListActions` to get the action-to-key map without a Decisions call. The tool reuses the build's startup mappings. Use `-ListActions -RefreshActions` if the active mappings differ.
+2. Match the user's gameplay objective to the listed action IDs. Run the test with a short objective and one check per requested behavior.
 
-```powershell
-python -B qa.py ai-test "<game executable>" --objective "Verify movement and jumping separately." --check IA_Move --check IA_Jump
-```
+   ```powershell
+   powershell.exe -NoProfile -ExecutionPolicy Bypass -Command '& .\Project-QA.ps1 -Objective "Verify movement and jumping separately." -Check IA_Move,IA_Jump'
+   ```
 
-Use one `--check` per requested action. Join up to 12 action IDs with `+` for simultaneous input, as in `--check IA_Move+IA_Jump`. If action IDs are unknown, run `python -B qa.py list-actions "<game executable>"` to discover them without a paid call. Report unsupported objectives as unverified.
+   Use the listed `Action@Key` variant for a specific key or movement direction. Join action IDs with `+` for simultaneous input. Report unsupported objectives as unverified.
+3. Report each result from the compact CLI output. `INPUT_CONFIRMED` confirms input action activation, with gameplay outcome unverified. The default Decisions call cap equals the number of checks. Read the detailed report when diagnosing an error or inconclusive result.
 
-Decisions chooses among the pending checks that Unreal can currently execute. The default call cap equals the number of checks. Use the compact CLI output to report each check's verdict and any unverified checks. Open the detailed JSON report only when you need to investigate a result. Avoid repeating an unchanged test.
-
-Use the local key registered by the user. If the CLI reports `API_KEY_MISSING`, ask the user to run `Register-OpenAI-Key.cmd`.
+If the tool reports `API_KEY_MISSING`, ask the user to run `Register-OpenAI-Key.cmd`. Never request the key in chat.

@@ -297,12 +297,12 @@ private:
         ReplyJson(Result);
     }
 
-    static TArray<TSharedPtr<FJsonValue>> HeldKeys(const FBridgeInput::FState& State, FBridgeInput::FInputMask Held)
+    static TArray<TSharedPtr<FJsonValue>> HeldKeys(const FBridgeInput::FState& State, const TSet<int32>& Held)
     {
         TArray<TSharedPtr<FJsonValue>> Keys;
         for (int32 Index = 0; Index < State.Bindings.Num(); ++Index)
         {
-            if (Held & FBridgeInput::InputBit(Index))
+            if (Held.Contains(Index))
             {
                 Keys.Add(MakeShared<FJsonValueString>(State.Bindings[Index].Key.ToString()));
             }
@@ -376,6 +376,7 @@ private:
             if (Duration < 0 || Json.HasField(TEXT("keys")) || Json.HasField(TEXT("hold_ms"))
                 || !Json.TryGetArrayField(TEXT("timeline"), Entries) || Entries->Num() > 96) { return false; }
             int32 Previous = 0;
+            int32 HeldCount = 0;
             TArray<int32> Started;
             Started.Init(-1, State.Bindings.Num());
             for (const auto& Entry : *Entries)
@@ -390,6 +391,8 @@ private:
                 if (!bDown && !Kind.Equals(TEXT("up"), ESearchCase::CaseSensitive)) { return false; }
                 int32& Start = Started[Key];
                 if (bDown ? Start >= 0 : (Start < 0 || At - Start < 20 || At - Start > 2000)) { return false; }
+                HeldCount += bDown ? 1 : -1;
+                if (HeldCount > FBridgeInput::MaxInputs) { return false; }
                 Start = bDown ? At : -1;
                 Previous = At;
                 Plan.Add({At, Key, bDown});
@@ -399,15 +402,13 @@ private:
         Duration = ReadInteger(Json.TryGetField(TEXT("hold_ms")).Get(), 20, 2000);
         if (Duration < 0 || Json.HasField(TEXT("duration_ms")) || !Json.TryGetArrayField(TEXT("keys"), Entries)
             || Entries->IsEmpty() || Entries->Num() > FBridgeInput::MaxInputs) { return false; }
-        FBridgeInput::FInputMask Mask = 0;
+        TSet<int32> Seen;
         for (const auto& Entry : *Entries)
         {
             const int32 Key = ResolveKey(Entry.Get(), State);
-            if (Key == INDEX_NONE) { return false; }
-            const auto Bit = FBridgeInput::InputBit(Key);
-            if (Mask & Bit) { return false; }
+            if (Key == INDEX_NONE || Seen.Contains(Key)) { return false; }
             Plan.Add({0, Key, true});
-            Mask |= Bit;
+            Seen.Add(Key);
         }
         const int32 Count = Plan.Num();
         for (int32 Index = 0; Index < Count; ++Index) { Plan.Add({Duration, Plan[Index].BindingIndex, false}); }
