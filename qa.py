@@ -7,6 +7,7 @@ import json
 import math
 import os
 import queue
+import re
 import secrets
 import subprocess
 import sys
@@ -41,6 +42,7 @@ ROOT = Path(__file__).resolve().parent
 FROZEN = getattr(sys, "frozen", False)
 OUT = (Path(os.environ["LOCALAPPDATA"]) / "UnrealAutoQA" if FROZEN else ROOT) / "runs"
 LIVE_INTERVAL_SECONDS = 2
+MAX_SIMULTANEOUS_INPUTS = 12
 # shortcut: reserve estimated tokens for the current short text payload, replace with a
 # verified upper bound before adding arbitrary-length game observations.
 INPUT_TOKEN_RESERVE = 1024
@@ -277,7 +279,8 @@ def bridge_test(executable, keys, hold_ms, expected, original=None, cancel=None,
             if steps is None:
                 if expected is None:
                     available = discovered_actions(mappings, {"player_exists": True, "on_ground": True})
-                    action = next((name for name in ("IA_Move", "IA_Jump") if name in available), None)
+                    action = next((name for name in ("IA_Move", "IA_Jump") if name in available),
+                                  next(iter(available), None))
                     if not action:
                         raise Rejected("NO_EXECUTABLE_ACTIONS")
                     keys, expected = available[action][0], [action]
@@ -566,7 +569,25 @@ def decide(allowed, live=False, *, catalog=None, scope="selected_actions", selec
 
 def explore(allowed, max_calls, max_seconds, live=False, *, max_input_tokens=100_000,
             max_estimated_usd=Decimal("0.01"), input_usd_per_million=Decimal("0.10"),
-            catalog=None, scope="selected_actions", selected_keys=None, executable=None, cancel=None):
+            catalog=None, scope="selected_actions", selected_keys=None, executable=None, cancel=None,
+            objective=None, checks=()):
+    if objective is not None:
+        objective = objective.strip()
+        if not 1 <= len(objective) <= 240:
+            raise Rejected("INVALID_TEST_OBJECTIVE")
+    automatic = executable is not None and catalog is None
+    check_results = {}
+    for check in checks:
+        actions = check.split("+")
+        if (len(actions) > MAX_SIMULTANEOUS_INPUTS or len(actions) != len(set(actions)) or any(
+                action == "WAIT" or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", action)
+                for action in actions)):
+            raise Rejected("INVALID_TEST_CHECK")
+        check_results.setdefault("+".join(sorted(actions)), "UNVERIFIED")
+    if check_results and (not automatic or len(check_results) > 20):
+        raise Rejected("INVALID_TEST_CHECK")
+    if max_calls is None:
+        max_calls = len(check_results) or 2
     if (not 1 <= max_calls <= 1000 or not 1 <= max_seconds <= 600
             or not 1 <= max_input_tokens <= 100_000_000
             or not max_estimated_usd.is_finite() or not Decimal("0.000001") <= max_estimated_usd <= 1000
@@ -580,12 +601,24 @@ def explore(allowed, max_calls, max_seconds, live=False, *, max_input_tokens=100
     retries = 0
     exhausted_states = {}
     rate = input_usd_per_million / 1_000_000
-    automatic = executable is not None and catalog is None
     if automatic and not live:
         raise Rejected("DECISIONS_REQUIRED")
     catalog = read_catalog(None) if catalog is None and not automatic else catalog
     outcome = "BUDGET_EXHAUSTED"
     started = time.monotonic()
+
+    def current_candidates(mappings, observation):
+        available = discovered_actions(mappings, observation)
+        if not check_results:
+            return available
+        candidates = {}
+        for check, verdict in check_results.items():
+            actions = check.split("+")
+            if verdict == "UNVERIFIED" and all(action in available for action in actions):
+                keys = [available[action][0][0] for action in actions]
+                candidates[check] = (keys, check, f"Test {' + '.join(actions)} together ({', '.join(keys)}).")
+        return candidates
+
     with (ue_transport(executable) if executable else transport()) as call:
         if executable:
             wait_for_ue_world(call)
@@ -625,7 +658,7 @@ def explore(allowed, max_calls, max_seconds, live=False, *, max_input_tokens=100
                         outcome = "STALE_DECISION"
                         break
                     envelope["expected_mapping_revision"] = mappings["mapping_revision"]
-                available = (discovered_actions(mappings, before) if automatic
+                available = (current_candidates(mappings, before) if automatic
                              else action_candidates(allowed, mappings, catalog, scope, selected_keys, before))
                 if automatic and available:
                     tested = {(item["choice"], item["mapping_revision"]) for item in attempts if "verdict" in item}
@@ -651,6 +684,9 @@ def explore(allowed, max_calls, max_seconds, live=False, *, max_input_tokens=100
                               else ("position", "jumps"))
                     state = json.dumps({name: before.get(name) for name in fields}, separators=(",", ":"))
                     prompt = f"Select the next gameplay test. Choose WAIT if none is suitable. State: {state}"
+                    if objective is not None:
+                        goal = json.dumps(objective, ensure_ascii=False)
+                        prompt += f" QA objective: {goal}. Choose an action that advances this objective, or WAIT."
                     estimate = max(reserve, len(choice_body(prompt, choices)) + 128)
                     projected = input_tokens + reserved_tokens + estimate
                     if projected > max_input_tokens or projected * rate > max_estimated_usd:
@@ -730,7 +766,7 @@ def explore(allowed, max_calls, max_seconds, live=False, *, max_input_tokens=100
                     if not owns_input(current) or current.get("lease_lost"):
                         outcome = "STALE_DECISION"
                         break
-                    eligible = discovered_actions(current_mappings, current)
+                    eligible = current_candidates(current_mappings, current)
                     changed = (current["expected_mapping_revision"] != mappings["mapping_revision"]
                                or current_mappings["mapping_revision"] != mappings["mapping_revision"]
                                or (choice != "WAIT" and eligible.get(choice) != available.get(choice)))
@@ -765,9 +801,14 @@ def explore(allowed, max_calls, max_seconds, live=False, *, max_input_tokens=100
                 if automatic and choice != "WAIT":
                     evidence = call(f"/events?after_seq={before['observation_seq']}")
                     attempt["mapping_revision"] = mappings["mapping_revision"]
-                    attempt["verdict"] = ue_input_verdict(attempt["command_status"], [action], before,
+                    attempt["verdict"] = ue_input_verdict(attempt["command_status"], action.split("+"), before,
                                                          attempt["after"], evidence, capabilities)
-                    if attempt["verdict"] == "FAIL":
+                    if check_results:
+                        check_results[choice] = attempt["verdict"]
+                        if "UNVERIFIED" not in check_results.values():
+                            outcome = "COVERAGE_COMPLETE"
+                            break
+                    elif attempt["verdict"] == "FAIL":
                         outcome = "ACTION_FAILED"
                         break
                 if len(attempts) < max_calls:
@@ -803,9 +844,15 @@ def explore(allowed, max_calls, max_seconds, live=False, *, max_input_tokens=100
             verdict = "INCONCLUSIVE"
         if outcome in ("BUDGET_EXHAUSTED", "COVERAGE_COMPLETE", "WAIT_NO_STATE_CHANGE") and any(item.get("verdict") == "PASS" for item in attempts):
             verdict = "PASS"
+    if check_results and outcome in ("BUDGET_EXHAUSTED", "COVERAGE_COMPLETE",
+                                     "WAIT_NO_STATE_CHANGE", "NO_EXECUTABLE_ACTIONS"):
+        results = set(check_results.values())
+        verdict = "FAIL" if "FAIL" in results else "PASS" if results == {"PASS"} else "INCONCLUSIVE"
     return save_report({"mode": "UE" if executable else "MOCK", "run_id": uuid4().hex, **build, "step": None,
                         "verdict": verdict,
                         "exploration": {"source": "openai" if live else "mock", "outcome": outcome,
+                                        "objective": objective,
+                                        "checks": check_results,
                                         "max_calls": max_calls, "max_seconds": max_seconds,
                                         "elapsed_seconds": round(time.monotonic() - started, 3),
                                         "latency_ms": percentiles,
@@ -1139,8 +1186,13 @@ def main():
     commands = parser.add_subparsers(dest="command", required=True)
     ai = commands.add_parser("ai-test")
     ai.add_argument("game", type=Path, help="Packaged Win64 game executable")
-    ai.add_argument("--max-calls", type=int, default=2)
+    ai.add_argument("--objective", help="Gameplay test objective in natural language (up to 240 characters)")
+    ai.add_argument("--check", action="append", default=[],
+                    help="Required Unreal action ID. Repeat for separate checks or join IDs with + for simultaneous input.")
+    ai.add_argument("--max-calls", type=int, help="Call cap (defaults to the number of checks, or 2 for exploration)")
     ai.add_argument("--max-seconds", type=int, default=30)
+    actions = commands.add_parser("list-actions", help="List testable Unreal action IDs without a Decisions call")
+    actions.add_argument("game", type=Path, help="Packaged Win64 game executable")
     ui = commands.add_parser("panel")
     ui.add_argument("--port", type=int, default=18500)
     ui.add_argument("--open-browser", action="store_true")
@@ -1167,6 +1219,12 @@ def main():
     recovery.add_argument("project", type=Path)
     args = parser.parse_args()
     try:
+        if args.command == "list-actions":
+            with ue_transport(args.game) as call:
+                wait_for_ue_world(call)
+                actions = discovered_actions(call("/mappings"), {"player_exists": True, "on_ground": True})
+            print(json.dumps(sorted(actions)))
+            return 0
         if args.command == "bridge-health":
             print(json.dumps(bridge_health(args.executable), indent=2))
             return 0
@@ -1195,7 +1253,8 @@ def main():
         if args.command == "panel":
             panel(args.port, args.open_browser, args.game)
             return 0
-        result = explore(None, args.max_calls, args.max_seconds, live=True, executable=args.game)
+        result = explore(None, args.max_calls, args.max_seconds, live=True, executable=args.game,
+                         objective=args.objective, checks=args.check)
     except Rejected as error:
         print(f"ERROR: {error}")
         return 2
@@ -1203,6 +1262,11 @@ def main():
         print(f"ERROR: {type(error).__name__}")
         return 2
     print(f'{result["mode"]} {result["verdict"]}: {OUT / result["run_id"]}.json')
+    if args.check:
+        exploration = result["exploration"]
+        print(json.dumps({"checks": exploration["checks"], "outcome": exploration["outcome"],
+                          "calls": len(exploration["attempts"]),
+                          "input_tokens": exploration["reported_input_tokens"]}, separators=(",", ":")))
     return {"PASS": 0, "INCONCLUSIVE": 1, "FAIL": 2, "ERROR": 2, "CANCELLED": 1}[result["verdict"]]
 
 

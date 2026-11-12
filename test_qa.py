@@ -26,9 +26,10 @@ from spikes import decisions_smoke
 
 class MockQaTests(unittest.TestCase):
     def test_decisions_stops_after_wait_and_ignores_pose_only_drift(self):
+        objective = "Verify that the character can move."
         session = {"session_id": "test", "schema_version": 1, "world_generation": 1,
                    "input_owner": "DECISIONS", "owner_revision": 1, "expected_mapping_revision": 1}
-        for selected in ("WAIT", "IA_Move"):
+        for selected, checks in (("WAIT", ()), ("IA_Move", ()), ("IA_Move", ("IA_Move", "IA_Jump"))):
             position = 0
 
             def call(path, payload=None):
@@ -58,11 +59,20 @@ class MockQaTests(unittest.TestCase):
                   patch.object(qa, "run_command", return_value="completed") as execute,
                   patch.object(qa, "save_report", side_effect=lambda value: value),
                   patch.object(qa, "LIVE_INTERVAL_SECONDS", 0)):
-                result = qa.explore(None, 5, 5, live=True, executable=Path(__file__))
+                result = qa.explore(None, 5, 5, live=True, executable=Path(__file__), objective=objective,
+                                    checks=checks)
             model.assert_called_once()
+            prompt, choices = model.call_args.args
+            self.assertIn(objective, prompt)
+            self.assertEqual(set(choices), {"IA_Move", "WAIT"})
+            self.assertEqual(result["exploration"]["objective"], objective)
             if selected == "WAIT":
                 self.assertEqual(result["exploration"]["outcome"], "WAIT_NO_STATE_CHANGE")
                 execute.assert_not_called()
+            elif checks:
+                self.assertEqual(result["verdict"], "INCONCLUSIVE")
+                self.assertEqual(result["exploration"]["checks"], {"IA_Move": "PASS", "IA_Jump": "UNVERIFIED"})
+                execute.assert_called_once()
             else:
                 self.assertEqual(result["verdict"], "PASS")
                 execute.assert_called_once()

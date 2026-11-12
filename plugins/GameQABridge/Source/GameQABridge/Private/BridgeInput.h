@@ -29,10 +29,22 @@ public:
     enum class EStatus { Idle, Running, Completed, Cancelled };
     enum class ELayer { Key, Action, Pawn };
 
+    static constexpr int32 MaxInputs = 12;
+    using FInputMask = uint16;
+
+    static constexpr FInputMask InputBit(int32 Index) { return FInputMask(1u << Index); }
+
+    struct FBinding
+    {
+        FName Key;
+        FName Action;
+        bool operator==(const FBinding&) const = default;
+    };
+
     struct FTransition
     {
         int32 AtMs;
-        uint8 Bit;
+        int32 BindingIndex;
         bool bDown;
     };
 
@@ -40,8 +52,8 @@ public:
     {
         uint64 Seq = 0;
         FGuid Request;
-        uint8 Bit = 0;
         FName Key;
+        FName Action;
         bool bDown = false;
         ELayer Layer = ELayer::Key;
     };
@@ -52,11 +64,9 @@ public:
         EStatus Status = EStatus::Idle;
         int32 World = 0;
         int32 Mapping = 0;
-        uint8 Allowed = 0;
-        uint8 Held = 0;
-        uint8 Pressed = 0;
-        FName MoveKey;
-        FName JumpKey;
+        FInputMask Held = 0;
+        FInputMask Pressed = 0;
+        TArray<FBinding> Bindings;
         uint64 EventSeq = 0;
         bool bReady = false;
         bool bGrounded = false;
@@ -184,12 +194,10 @@ public:
             TargetWorld.Reset();
             TargetController.Reset();
             TargetPawn.Reset();
-            MoveAction.Reset();
-            JumpAction.Reset();
+            Actions.Reset();
             State.bReady = false;
-            State.Allowed = 0;
             State.Pressed = 0;
-            State.MoveKey = State.JumpKey = NAME_None;
+            State.Bindings.Reset();
             EffectiveMappings.Reset();
             ActiveContexts.Reset();
             MappingSignature = 0;
@@ -218,21 +226,17 @@ public:
             ++State.World;
             ReadyFrames = 0;
         }
-        const auto Mapping = FindAllowed(PlayerInput);
-        if (Mapping.Signature != MappingSignature || Mapping.Move != MoveAction || Mapping.Jump != JumpAction
-            || Mapping.MoveKey.GetFName() != State.MoveKey || Mapping.JumpKey.GetFName() != State.JumpKey)
+        auto Mapping = FindAllowed(PlayerInput);
+        if (Mapping.Signature != MappingSignature || Mapping.Bindings != State.Bindings || Mapping.Actions != Actions)
         {
             Finish(EStatus::Cancelled);
-            MoveAction = Mapping.Move;
-            JumpAction = Mapping.Jump;
-            State.MoveKey = Mapping.MoveKey.GetFName();
-            State.JumpKey = Mapping.JumpKey.GetFName();
-            State.Allowed = (MoveAction.IsValid() ? 1 : 0) | (JumpAction.IsValid() ? 2 : 0);
+            Actions = MoveTemp(Mapping.Actions);
+            State.Bindings = MoveTemp(Mapping.Bindings);
             MappingSignature = Mapping.Signature;
             RefreshMappings(LP, PlayerInput);
             ++State.Mapping;
         }
-        if (Pawn && Viewport && Viewport->Viewport && State.Allowed)
+        if (Pawn && Viewport && Viewport->Viewport && !State.Bindings.IsEmpty())
         {
             // Startup can stall on the first rendered frame after the player has spawned.
             ReadyFrames = FMath::Min(ReadyFrames + 1, 8);
@@ -242,8 +246,11 @@ public:
             ReadyFrames = 0;
         }
         State.bReady = ReadyFrames == 8;
-        State.Pressed = PC ? ((State.Allowed & 1) && PC->IsInputKeyDown(FKey(State.MoveKey)) ? 1 : 0)
-            | ((State.Allowed & 2) && PC->IsInputKeyDown(FKey(State.JumpKey)) ? 2 : 0) : 0;
+        State.Pressed = 0;
+        for (int32 Index = 0; PC && Index < State.Bindings.Num(); ++Index)
+        {
+            if (PC->IsInputKeyDown(FKey(State.Bindings[Index].Key))) { State.Pressed |= InputBit(Index); }
+        }
         if (Pawn)
         {
             State.Position = Pawn->GetActorLocation();
@@ -272,26 +279,27 @@ public:
         DownDevice = IPlatformInputDeviceMapper::Get().GetPrimaryInputDeviceForUser(LP->GetPlatformUserId());
         DownViewport = Viewport;
         const int32 At = Transitions[Next].AtMs;
-        uint8 Changed = 0;
+        FInputMask Changed = 0;
         while (Transitions.IsValidIndex(Next) && Transitions[Next].AtMs == At)
         {
             const auto& Step = Transitions[Next];
-            if (Changed & Step.Bit) { break; }
-            if (!DownDevice.IsValid() || (Step.bDown && (State.Pressed & Step.Bit)))
+            const auto Bit = InputBit(Step.BindingIndex);
+            if (Changed & Bit) { break; }
+            if (!DownDevice.IsValid() || (Step.bDown && (State.Pressed & Bit)))
             {
                 Finish(EStatus::Cancelled);
                 return;
             }
-            if (Step.bDown) { State.Held |= Step.Bit; }
-            if (!Send(Step.Bit, Step.bDown))
+            if (Step.bDown) { State.Held |= Bit; }
+            if (!Send(Step.BindingIndex, Step.bDown))
             {
                 Finish(EStatus::Cancelled);
                 return;
             }
-            if (!Step.bDown) { State.Held &= ~Step.Bit; }
-            ReportedActions &= ~Step.Bit;
-            Record(Step.Bit, Step.bDown);
-            Changed |= Step.Bit;
+            if (!Step.bDown) { State.Held &= ~Bit; }
+            ReportedActions &= ~Bit;
+            Record(Step.BindingIndex, Step.bDown);
+            Changed |= Bit;
             ++Next;
         }
         const int32 Following = Transitions.IsValidIndex(Next) ? Transitions[Next].AtMs : Duration;
@@ -305,73 +313,87 @@ public:
         const auto* PC = TargetController.Get();
         const auto* PlayerInput = PC ? Cast<UEnhancedPlayerInput>(PC->PlayerInput) : nullptr;
         if (!PlayerInput) { return; }
-        for (uint8 Bit : {uint8{1}, uint8{2}})
+        for (int32 Index = 0; Index < Actions.Num(); ++Index)
         {
+            const auto Bit = InputBit(Index);
             if (!(State.Held & Bit) || (ReportedActions & Bit)) { continue; }
-            const auto* Action = Bit == 1 ? MoveAction.Get() : JumpAction.Get();
+            const auto* Action = Actions[Index].Get();
             const auto* Instance = Action ? PlayerInput->FindActionInstanceData(Action) : nullptr;
             if (Instance && Instance->GetTriggerEvent() == ETriggerEvent::Triggered)
             {
-                Record(Bit, true, ELayer::Action);
+                Record(Index, true, ELayer::Action);
                 ReportedActions |= Bit;
-                if (Bit == 2 && State.bGrounded)
+                if (State.Bindings[Index].Action == JumpName && State.bGrounded)
                 {
                     JumpStart = State.Position.Z;
-                    bObserveJump = true;
+                    JumpIndex = Index;
                 }
             }
         }
         const auto* Pawn = TargetPawn.Get();
-        if (bObserveJump && Pawn && Pawn->GetActorLocation().Z > JumpStart + 0.5 && Pawn->GetVelocity().Z > 0.0)
+        if (JumpIndex != INDEX_NONE && Pawn && Pawn->GetActorLocation().Z > JumpStart + 0.5 && Pawn->GetVelocity().Z > 0.0)
         {
-            Record(2, true, ELayer::Pawn);
-            bObserveJump = false;
+            Record(JumpIndex, true, ELayer::Pawn);
+            JumpIndex = INDEX_NONE;
         }
     }
 
 private:
+    inline static const FName JumpName{TEXT("IA_Jump")};
+
     struct FAllowedActions
     {
-        TWeakObjectPtr<const UInputAction> Move;
-        TWeakObjectPtr<const UInputAction> Jump;
-        FKey MoveKey;
-        FKey JumpKey;
+        TArray<FBinding> Bindings;
+        TArray<TWeakObjectPtr<const UInputAction>> Actions;
         uint32 Signature = 0;
     };
 
     FAllowedActions FindAllowed(const UEnhancedPlayerInput* Input) const
     {
-        FAllowedActions Keys;
-        static const FName MoveName(TEXT("IA_Move"));
-        static const FName JumpName(TEXT("IA_Jump"));
-        bool bAmbiguousMove = false;
-        bool bAmbiguousJump = false;
-        const auto Select = [](const FEnhancedActionKeyMapping& Mapping,
-            TWeakObjectPtr<const UInputAction>& Action, FKey& Key, bool& bAmbiguous)
+        FAllowedActions Result;
+        if (!Input) { return Result; }
+
+        TMap<FName, const FEnhancedActionKeyMapping*> ByAction;
+        TMap<FName, const UInputAction*> ByKey;
+        for (const auto& Mapping : Input->GetEnhancedActionMappingsView())
         {
-            bAmbiguous |= Action.IsValid() && (Action.Get() != Mapping.Action.Get() || Key != Mapping.Key);
-            Action = Mapping.Action.Get();
-            Key = Mapping.Key;
-        };
-        if (Input)
-        {
-            for (const auto& Mapping : Input->GetEnhancedActionMappingsView())
+            if (!Mapping.Action) { continue; }
+            const auto Key = Mapping.Key.GetFName();
+            const auto Action = Mapping.Action->GetFName();
+            Result.Signature = HashCombine(Result.Signature, GetTypeHash(Key));
+            Result.Signature = HashCombine(Result.Signature, PointerHash(Mapping.Action.Get()));
+            for (const auto& Trigger : Mapping.Triggers) { Result.Signature = HashCombine(Result.Signature, PointerHash(Trigger.Get())); }
+            for (const auto& Modifier : Mapping.Modifiers) { Result.Signature = HashCombine(Result.Signature, PointerHash(Modifier.Get())); }
+            if (!ApprovedKeys.Contains(Mapping.Key)) { continue; }
+
+            if (auto** Existing = ByAction.Find(Action))
             {
-                if (!Mapping.Action) { continue; }
-                Keys.Signature = HashCombine(Keys.Signature, GetTypeHash(Mapping.Key.GetFName()));
-                Keys.Signature = HashCombine(Keys.Signature, PointerHash(Mapping.Action.Get()));
-                for (const auto& Trigger : Mapping.Triggers) { Keys.Signature = HashCombine(Keys.Signature, PointerHash(Trigger.Get())); }
-                for (const auto& Modifier : Mapping.Modifiers) { Keys.Signature = HashCombine(Keys.Signature, PointerHash(Modifier.Get())); }
-                if (!ApprovedKeys.Contains(Mapping.Key)) { continue; }
-                const FName Name = Mapping.Action->GetFName();
-                if (Name == MoveName) { Select(Mapping, Keys.Move, Keys.MoveKey, bAmbiguousMove); }
-                if (Name == JumpName) { Select(Mapping, Keys.Jump, Keys.JumpKey, bAmbiguousJump); }
+                if (*Existing && ((*Existing)->Action != Mapping.Action || (*Existing)->Key != Mapping.Key))
+                {
+                    *Existing = nullptr;
+                }
             }
+            else { ByAction.Add(Action, &Mapping); }
+
+            if (auto** Existing = ByKey.Find(Key))
+            {
+                if (*Existing != Mapping.Action.Get()) { *Existing = nullptr; }
+            }
+            else { ByKey.Add(Key, Mapping.Action.Get()); }
         }
-        if (Keys.MoveKey.IsValid() && Keys.MoveKey == Keys.JumpKey) { bAmbiguousMove = bAmbiguousJump = true; }
-        if (bAmbiguousMove) { Keys.Move.Reset(); Keys.MoveKey = FKey(); }
-        if (bAmbiguousJump) { Keys.Jump.Reset(); Keys.JumpKey = FKey(); }
-        return Keys;
+
+        TArray<FName> Names;
+        ByAction.GetKeys(Names);
+        Names.Sort(FNameLexicalLess());
+        for (const auto Name : Names)
+        {
+            const auto* Mapping = ByAction[Name];
+            if (!Mapping || ByKey.FindRef(Mapping->Key.GetFName()) != Mapping->Action.Get()) { continue; }
+            Result.Bindings.Add({Mapping->Key.GetFName(), Name});
+            Result.Actions.Add(Mapping->Action.Get());
+            if (Result.Bindings.Num() == MaxInputs) { break; }
+        }
+        return Result;
     }
 
     void RefreshMappings(ULocalPlayer* Player, const UEnhancedPlayerInput* Input)
@@ -402,11 +424,11 @@ private:
         }
     }
 
-    bool Send(uint8 Bit, bool bPress)
+    bool Send(int32 Index, bool bPress)
     {
         auto* Viewport = DownViewport.Get();
         auto* PC = TargetController.Get();
-        const auto Event = FInputKeyEventArgs::CreateSimulated(FKey(Bit == 1 ? State.MoveKey : State.JumpKey),
+        const auto Event = FInputKeyEventArgs::CreateSimulated(FKey(State.Bindings[Index].Key),
             bPress ? IE_Pressed : IE_Released, bPress ? 1.0f : 0.0f,
             -1, DownDevice, false, Viewport ? Viewport->Viewport : nullptr);
         if (Viewport && Viewport->Viewport && PC && TargetWorld.IsValid() && PC == TargetWorld->GetFirstPlayerController()
@@ -417,18 +439,18 @@ private:
     void Finish(EStatus Status)
     {
         if (State.Status != EStatus::Running) { return; }
-        for (uint8 Bit : {uint8{1}, uint8{2}})
+        for (int32 Index = 0; Index < State.Bindings.Num(); ++Index)
         {
-            if (State.Held & Bit)
+            if (State.Held & InputBit(Index))
             {
-                Send(Bit, false);
-                Record(Bit, false);
+                Send(Index, false);
+                Record(Index, false);
             }
         }
         State.Held = 0;
         Transitions.Reset();
         ReportedActions = 0;
-        bObserveJump = false;
+        JumpIndex = INDEX_NONE;
         State.Status = Status;
     }
 
@@ -441,10 +463,11 @@ private:
         }
     }
 
-    void Record(uint8 Bit, bool bDown, ELayer Layer = ELayer::Key)
+    void Record(int32 BindingIndex, bool bDown, ELayer Layer = ELayer::Key)
     {
         const uint64 Index = State.EventSeq++;
-        Events[Index % EventLimit] = {State.EventSeq, Request, Bit, Bit == 1 ? State.MoveKey : State.JumpKey, bDown, Layer};
+        const auto& Binding = State.Bindings[BindingIndex];
+        Events[Index % EventLimit] = {State.EventSeq, Request, Binding.Key, Binding.Action, bDown, Layer};
     }
 
     std::mutex Mutex;
@@ -458,15 +481,14 @@ private:
     TWeakObjectPtr<UWorld> TargetWorld;
     TWeakObjectPtr<APlayerController> TargetController;
     TWeakObjectPtr<APawn> TargetPawn;
-    TWeakObjectPtr<const UInputAction> MoveAction;
-    TWeakObjectPtr<const UInputAction> JumpAction;
+    TArray<TWeakObjectPtr<const UInputAction>> Actions;
     TWeakObjectPtr<UGameViewportClient> DownViewport;
     FInputDeviceId DownDevice = INPUTDEVICEID_NONE;
     TArray<FTransition> Transitions;
     int32 Next = 0, Duration = 0;
     int32 ReadyFrames = 0;
-    uint8 ReportedActions = 0;
+    FInputMask ReportedActions = 0;
     double NextAt = 0.0, DeadlineAt = 0.0, LeaseUntil = 0.0, LastWorldTick = 0.0, JumpStart = 0.0;
     bool bCancel = false;
-    bool bObserveJump = false;
+    int32 JumpIndex = INDEX_NONE;
 };

@@ -157,8 +157,10 @@ private:
             const auto& State = Mappings.State;
             auto Result = MakeShared<FJsonObject>();
             auto Keys = MakeShared<FJsonObject>();
-            if (State.Allowed & 1) { Keys->SetStringField(State.MoveKey.ToString(), TEXT("IA_Move")); }
-            if (State.Allowed & 2) { Keys->SetStringField(State.JumpKey.ToString(), TEXT("IA_Jump")); }
+            for (const auto& Binding : State.Bindings)
+            {
+                Keys->SetStringField(Binding.Key.ToString(), Binding.Action.ToString());
+            }
             Result->SetNumberField(TEXT("mapping_revision"), State.Mapping);
             Result->SetObjectField(TEXT("keys"), Keys);
             auto Contexts = MakeShared<FJsonObject>();
@@ -219,7 +221,7 @@ private:
                 Value->SetStringField(TEXT("kind"), Edge.Layer == FBridgeInput::ELayer::Pawn ? TEXT("JumpRise")
                     : Edge.Layer == FBridgeInput::ELayer::Action ? TEXT("Triggered") : Edge.bDown ? TEXT("KeyDown") : TEXT("KeyUp"));
                 Value->SetStringField(TEXT("value"), Edge.Layer != FBridgeInput::ELayer::Key
-                    ? (Edge.Bit == 1 ? TEXT("IA_Move") : TEXT("IA_Jump"))
+                    ? Edge.Action.ToString()
                     : Edge.Key.ToString());
                 Values.Add(MakeShared<FJsonValueObject>(Value));
             }
@@ -295,11 +297,16 @@ private:
         ReplyJson(Result);
     }
 
-    static TArray<TSharedPtr<FJsonValue>> HeldKeys(const FBridgeInput::FState& State, uint8 Held)
+    static TArray<TSharedPtr<FJsonValue>> HeldKeys(const FBridgeInput::FState& State, FBridgeInput::FInputMask Held)
     {
         TArray<TSharedPtr<FJsonValue>> Keys;
-        if (Held & 1) { Keys.Add(MakeShared<FJsonValueString>(State.MoveKey.ToString())); }
-        if (Held & 2) { Keys.Add(MakeShared<FJsonValueString>(State.JumpKey.ToString())); }
+        for (int32 Index = 0; Index < State.Bindings.Num(); ++Index)
+        {
+            if (Held & FBridgeInput::InputBit(Index))
+            {
+                Keys.Add(MakeShared<FJsonValueString>(State.Bindings[Index].Key.ToString()));
+            }
+        }
         return Keys;
     }
 
@@ -348,13 +355,14 @@ private:
         return N >= Min && N <= Max && FMath::FloorToDouble(N) == N ? static_cast<int32>(N) : -1;
     }
 
-    static uint8 ResolveKey(const FJsonValue* Value, const FBridgeInput::FState& State)
+    static int32 ResolveKey(const FJsonValue* Value, const FBridgeInput::FState& State)
     {
-        if (!Value || Value->Type != EJson::String) { return 0; }
+        if (!Value || Value->Type != EJson::String) { return INDEX_NONE; }
         const FString Name = Value->AsString();
-        if ((State.Allowed & 1) && Name.Equals(State.MoveKey.ToString(), ESearchCase::CaseSensitive)) { return 1; }
-        if ((State.Allowed & 2) && Name.Equals(State.JumpKey.ToString(), ESearchCase::CaseSensitive)) { return 2; }
-        return 0;
+        return State.Bindings.IndexOfByPredicate([&Name](const FBridgeInput::FBinding& Binding)
+        {
+            return Name.Equals(Binding.Key.ToString(), ESearchCase::CaseSensitive);
+        });
     }
 
     static bool ReadPlan(const FJsonObject& Json, const FBridgeInput::FState& State,
@@ -368,38 +376,41 @@ private:
             if (Duration < 0 || Json.HasField(TEXT("keys")) || Json.HasField(TEXT("hold_ms"))
                 || !Json.TryGetArrayField(TEXT("timeline"), Entries) || Entries->Num() > 96) { return false; }
             int32 Previous = 0;
-            int32 Started[] = {-1, -1};
+            TArray<int32> Started;
+            Started.Init(-1, State.Bindings.Num());
             for (const auto& Entry : *Entries)
             {
                 if (Entry->Type != EJson::Array || Entry->AsArray().Num() != 3) { return false; }
                 const auto& Fields = Entry->AsArray();
                 const int32 At = ReadInteger(Fields[0].Get(), Previous, Duration);
-                const uint8 Key = ResolveKey(Fields[2].Get(), State);
-                if (At < 0 || !Key || Fields[1]->Type != EJson::String) { return false; }
+                const int32 Key = ResolveKey(Fields[2].Get(), State);
+                if (At < 0 || Key == INDEX_NONE || Fields[1]->Type != EJson::String) { return false; }
                 const FString Kind = Fields[1]->AsString();
                 const bool bDown = Kind.Equals(TEXT("down"), ESearchCase::CaseSensitive);
                 if (!bDown && !Kind.Equals(TEXT("up"), ESearchCase::CaseSensitive)) { return false; }
-                int32& Start = Started[Key - 1];
+                int32& Start = Started[Key];
                 if (bDown ? Start >= 0 : (Start < 0 || At - Start < 20 || At - Start > 2000)) { return false; }
                 Start = bDown ? At : -1;
                 Previous = At;
                 Plan.Add({At, Key, bDown});
             }
-            return Started[0] < 0 && Started[1] < 0;
+            return !Started.ContainsByPredicate([](int32 Start) { return Start >= 0; });
         }
         Duration = ReadInteger(Json.TryGetField(TEXT("hold_ms")).Get(), 20, 2000);
         if (Duration < 0 || Json.HasField(TEXT("duration_ms")) || !Json.TryGetArrayField(TEXT("keys"), Entries)
-            || Entries->IsEmpty() || Entries->Num() > 2) { return false; }
-        uint8 Mask = 0;
+            || Entries->IsEmpty() || Entries->Num() > FBridgeInput::MaxInputs) { return false; }
+        FBridgeInput::FInputMask Mask = 0;
         for (const auto& Entry : *Entries)
         {
-            const uint8 Key = ResolveKey(Entry.Get(), State);
-            if (!Key || (Mask & Key)) { return false; }
+            const int32 Key = ResolveKey(Entry.Get(), State);
+            if (Key == INDEX_NONE) { return false; }
+            const auto Bit = FBridgeInput::InputBit(Key);
+            if (Mask & Bit) { return false; }
             Plan.Add({0, Key, true});
-            Mask |= Key;
+            Mask |= Bit;
         }
         const int32 Count = Plan.Num();
-        for (int32 Index = 0; Index < Count; ++Index) { Plan.Add({Duration, Plan[Index].Bit, false}); }
+        for (int32 Index = 0; Index < Count; ++Index) { Plan.Add({Duration, Plan[Index].BindingIndex, false}); }
         return true;
     }
 
